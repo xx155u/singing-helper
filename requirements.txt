@@ -2,3 +2,5 @@ gradio
 numpy 
 librosa 
 matplotlib
+moviepy
+opencv-python
