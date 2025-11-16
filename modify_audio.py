@@ -110,13 +110,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start_sec", 
         type=float, 
-        default=5.0, 
+        default=0, 
         help="開始修改的時間點 (秒)。預設為 0.0。"
     )
     parser.add_argument(
         "--end_sec", 
         type=float, 
-        default=13.0, 
+        default=100.0, 
         help="結束修改的時間點 (秒)。預設為音訊總時長。"
     )
     parser.add_argument(
@@ -128,7 +128,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--speed", 
         type=float, 
-        default=1.5, 
+        default=1, 
         help="播放速度調整倍數。大於 1.0 加速，小於 1.0 減速。預設為 1.0。"
     )
 
@@ -149,4 +149,11 @@ if __name__ == "__main__":
 python /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/modify_audio.py \
     --input_audio_path /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/關於小熊.flac \
     --output_audio_path /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/關於小熊_mod.flac
+
+/Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/關於小熊_10_mod.flac  
+
+python /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/modify_audio.py \
+    --input_audio_path /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/關於小熊_10_mod.flac   \
+    --output_audio_path /Users/wtforbes/Library/CloudStorage/Dropbox/singing-helper/關於小熊_10_mod_pitch.flac  
+
 """

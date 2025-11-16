@@ -32,6 +32,7 @@ import time
 from collections import deque
 
 import subprocess
+from librosa.onset import onset_detect, onset_strength
 
 
 
@@ -49,6 +50,14 @@ def extract_pseudo_onsets(features, smooth=5, threshold_ratio=0.3):
     onsets = [i for i in range(1, len(rms_smooth))
               if rms_smooth[i] > th and rms_smooth[i] > rms_smooth[i-1]]
     return np.asarray(onsets, dtype=float)
+
+    # o_env = onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+    # onsets = onset_detect(onset_envelope=o_env, sr=sr,
+    #                       hop_length=HOP_LENGTH, backtrack=True)
+    # return np.asarray(onsets, dtype=float)
+
+
+
 
 def tempo_similarity(feat_in, feat_ref):
     """回傳 0–100 的節奏分數，越高越同步"""
