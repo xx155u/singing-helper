@@ -7,6 +7,7 @@ import matplotlib.animation as animation
 import soundfile as sf
 import tempfile
 import os
+from librosa.sequence import dtw
 # from moviepy import AudioFileClip, VideoClip, CompositeVideoClip
 import cv2
 
@@ -31,6 +32,38 @@ import time
 from collections import deque
 
 import subprocess
+
+
+
+def extract_pseudo_onsets(features, smooth=5, threshold_ratio=0.3):
+    """
+    由 RMS 特徵偵測 pseudo-onsets（節奏強拍）。
+    features 形狀 (N, 13)；最後一維是 RMS。
+    """
+    rms = features[:, -1]
+    # 簡易平滑
+    rms_smooth = np.convolve(rms, np.ones(smooth) / smooth, mode='same')
+    rms_smooth = (rms_smooth - rms_smooth.min()) / (rms_smooth.ptp() + 1e-8)
+
+    th = rms_smooth.mean() + threshold_ratio * rms_smooth.std()
+    onsets = [i for i in range(1, len(rms_smooth))
+              if rms_smooth[i] > th and rms_smooth[i] > rms_smooth[i-1]]
+    return np.asarray(onsets, dtype=float)
+
+def tempo_similarity(feat_in, feat_ref):
+    """回傳 0–100 的節奏分數，越高越同步"""
+    on1, on2 = extract_pseudo_onsets(feat_in), extract_pseudo_onsets(feat_ref)
+    if len(on1) < 2 or len(on2) < 2:
+        return 20.0  # 拍點不足
+
+    L = max(len(on1), len(on2))
+    a = np.pad(on1, (0, L-len(on1)), 'edge').reshape(-1, 1)
+    b = np.pad(on2, (0, L-len(on2)), 'edge').reshape(-1, 1)
+
+    D, _ = dtw(a, b)          # DTW 距離
+    dist = D[-1, -1]
+    score = 100 * np.exp(-dist / 50)   # 距離→分數
+    return float(np.clip(score, 0, 100))
 
 def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path=None):
     """
@@ -103,7 +136,7 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         
         # === 音高偏差追蹤圖 ===
         ax_pitch = fig.add_subplot(gs[1])
-        window_size = 10.0
+        window_size = 3.0
         x_min = max(0, current_time - window_size / 2)
         x_max = current_time + window_size / 2
         
@@ -468,7 +501,9 @@ def windowed_pitch_analysis(features_input, features_ref, window_size=5.0, overl
             )
             
             # 計算節奏分數
-            tempo_score = calculate_tempo_score(len(input_window), len(ref_window))
+            # tempo_score = calculate_tempo_score(len(input_window), len(ref_window))
+            tempo_score = calculate_tempo_score(input_window, ref_window)  # 現在傳特徵矩陣
+
             
             # 整體視窗分數
             overall_score = 0.7 * pitch_score + 0.3 * tempo_score
@@ -536,15 +571,23 @@ def calculate_window_pitch_score(chroma_input, chroma_ref, D, wp):
     return pitch_score, abs(pitch_diff), pitch_direction
 
 
-def calculate_tempo_score(input_frames, ref_frames):
-    """計算節奏分數"""
-    tempo_ratio = input_frames / (ref_frames + 1e-8)
+def calculate_tempo_score(input_feat, ref_feat):
+    """
+    節奏分數 (0–100)。直接呼叫 tempo_similarity。
+    input_feat, ref_feat 皆為 (N_frames, 13) ndarray
+    """
+    return tempo_similarity(input_feat, ref_feat)
+
+# TODO: wrong definition
+# def calculate_tempo_score(input_frames, ref_frames):
+#     """計算節奏分數"""
+#     tempo_ratio = input_frames / (ref_frames + 1e-8)
     
-    # 理想比例為 1，偏離越多分數越低
-    tempo_deviation = abs(tempo_ratio - 1.0)
-    tempo_score = max(0, 100 * (1 - tempo_deviation * 2))
+#     # 理想比例為 1，偏離越多分數越低
+#     tempo_deviation = abs(tempo_ratio - 1.0)
+#     tempo_score = max(0, 100 * (1 - tempo_deviation * 2))
     
-    return tempo_score
+#     return tempo_score
 
 
 # 核心邏輯 6: 視窗分析結果可視化 (Windowed Analysis Visualization)
@@ -1012,3 +1055,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title=title) as demo:
 
 if __name__ == "__main__":
     demo.launch(share=True)
+
+
+
+"""
+1. progress bar of generating video(current running time/expected time to run)
+2. 檢查節奏的計算
+3. 校正音檔(sliding window)
+4. 起始點對齊
+"""
