@@ -1037,7 +1037,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title=title) as demo:
     # 主分析流程
     def run_analysis(input_audio_path, ref_audio_path, should_generate_video):
         (score, feedback, plot, _, _, mixed_path, 
-         animation_path) = singing_evaluator(input_audio_path, ref_audio_path, 
+        animation_path) = singing_evaluator(input_audio_path, ref_audio_path, 
                                             generate_video=should_generate_video)
         
         return {
@@ -1069,7 +1069,5 @@ if __name__ == "__main__":
 
 """
 1. progress bar of generating video(current running time/expected time to run)
-2. 檢查節奏的計算
-3. 校正音檔(sliding window)
-4. 起始點對齊
+
 """

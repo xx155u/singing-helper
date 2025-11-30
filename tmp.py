@@ -7,11 +7,9 @@ import matplotlib.animation as animation
 import soundfile as sf
 import tempfile
 import os
+from librosa.sequence import dtw
+# from moviepy import AudioFileClip, VideoClip, CompositeVideoClip
 import cv2
-import threading
-import time
-from collections import deque
-import subprocess
 
 # 中文字體設定
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -20,11 +18,66 @@ plt.rcParams['axes.unicode_minus'] = False
 # 全域設定
 TARGET_SR = 16000
 HOP_LENGTH = 512
+# --- 全域設定 (Global Settings) ---
+TARGET_SR = 16000 # 設定統一的取樣率以進行公平比較
+HOP_LENGTH = 512 # Librosa 預設的 Frame Hop 長度
+# --- 中文字體設定 (Chinese Font Configuration) ---
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 解決負號顯示問
 
-def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path=None, progress=gr.Progress()):
+
+# 在原有 import 後添加
+import threading
+import time
+from collections import deque
+
+import subprocess
+from librosa.onset import onset_detect, onset_strength
+
+
+
+def extract_pseudo_onsets(features, smooth=5, threshold_ratio=0.3):
+    """
+    由 RMS 特徵偵測 pseudo-onsets（節奏強拍）。
+    features 形狀 (N, 13)；最後一維是 RMS。
+    """
+    rms = features[:, -1]
+    # 簡易平滑
+    rms_smooth = np.convolve(rms, np.ones(smooth) / smooth, mode='same')
+    rms_smooth = (rms_smooth - rms_smooth.min()) / (np.ptp(rms_smooth) + 1e-8)
+
+    th = rms_smooth.mean() + threshold_ratio * rms_smooth.std()
+    onsets = [i for i in range(1, len(rms_smooth))
+              if rms_smooth[i] > th and rms_smooth[i] > rms_smooth[i-1]]
+    return np.asarray(onsets, dtype=float)
+
+    # o_env = onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+    # onsets = onset_detect(onset_envelope=o_env, sr=sr,
+    #                       hop_length=HOP_LENGTH, backtrack=True)
+    # return np.asarray(onsets, dtype=float)
+
+
+
+
+def tempo_similarity(feat_in, feat_ref):
+    """回傳 0–100 的節奏分數，越高越同步"""
+    on1, on2 = extract_pseudo_onsets(feat_in), extract_pseudo_onsets(feat_ref)
+    if len(on1) < 2 or len(on2) < 2:
+        return 20.0  # 拍點不足
+
+    L = max(len(on1), len(on2))
+    a = np.pad(on1, (0, L-len(on1)), 'edge').reshape(-1, 1)
+    b = np.pad(on2, (0, L-len(on2)), 'edge').reshape(-1, 1)
+
+    D, _ = dtw(a, b)          # DTW 距離
+    dist = D[-1, -1]
+    score = 100 * np.exp(-dist / 50)   # 距離→分數
+    return float(np.clip(score, 0, 100))
+
+def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path=None, progress=None):
     """
     使用純 matplotlib + ffmpeg 生成動畫影片
-    相容新版 matplotlib，移除所有 emoji 符號
+    支援 Gradio 進度條回報
     """
     if not pitch_timeline:
         print("⚠️ 無音高時間軸數據，跳過影片生成")
@@ -33,7 +86,6 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
     if output_path is None:
         output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     
-    progress(0, desc="準備生成動畫影片...")
     print("📊 開始生成動畫影片...")
     
     # 提取數據
@@ -42,15 +94,15 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
     similarities = np.array([d['similarity'] for d in pitch_timeline])
     
     duration = times[-1]
-    fps = 20
+    fps = 20  # 幀率
+    total_frames = int(duration * fps)
     
-    progress(0.1, desc="創建動畫圖形...")
     # 創建圖形
     fig = plt.figure(figsize=(14, 10))
     
-    def animate(frame):
-        """動畫更新函數（移除所有 emoji）"""
-        current_time = frame / fps
+    # 定義繪圖函數 (與原版相同，但為了效能，我們直接在迴圈內呼叫)
+    def draw_frame(frame_idx):
+        current_time = frame_idx / fps
         fig.clear()
         
         gs = fig.add_gridspec(3, 1, height_ratios=[1, 2, 2], hspace=0.3)
@@ -66,7 +118,7 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
             pitch_diff = current_data['pitch_diff']
             similarity = current_data['similarity']
             
-            # 狀態判斷（改用純文字標籤）
+            # 狀態判斷
             if abs(pitch_diff) < 0.5:
                 status = "[準確] 音準準確"
                 status_color = 'green'
@@ -79,7 +131,7 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
             
             direction = "偏高" if pitch_diff > 0 else "偏低" if pitch_diff < 0 else "準確"
             
-            # 顯示狀態（使用矩形背景突顯）
+            # 顯示狀態
             bbox_props = dict(boxstyle='round,pad=0.5', facecolor=status_color, alpha=0.2)
             status_text = f"{status}\n當前時間: {current_time:.2f} 秒"
             ax_status.text(0.5, 0.7, status_text, 
@@ -94,7 +146,7 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         
         # === 音高偏差追蹤圖 ===
         ax_pitch = fig.add_subplot(gs[1])
-        window_size = 10.0
+        window_size = 3.0
         x_min = max(0, current_time - window_size / 2)
         x_max = current_time + window_size / 2
         
@@ -104,22 +156,22 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         colors_played = ['red' if abs(pd) > 1.5 else 'orange' if abs(pd) > 0.5 else 'green' 
                          for pd in pitch_diffs[mask_played]]
         
-        # 繪製已播放部分（高亮）
+        # 繪製已播放部分
         if np.any(mask_played):
             ax_pitch.scatter(times[mask_played], pitch_diffs[mask_played], 
                             c=colors_played, alpha=0.8, s=50, zorder=3, edgecolors='black', linewidth=0.5)
             ax_pitch.plot(times[mask_played], pitch_diffs[mask_played], 
                          color='gray', alpha=0.5, linewidth=2, zorder=2)
         
-        # 繪製未播放部分（灰色）
+        # 繪製未播放部分
         if np.any(mask_future):
             ax_pitch.scatter(times[mask_future], pitch_diffs[mask_future], 
                             c='lightgray', alpha=0.3, s=30, zorder=1)
         
-        # 當前播放位置標記
+        # 當前播放位置
         ax_pitch.axvline(x=current_time, color='blue', linestyle='-', linewidth=3, zorder=4)
         
-        # 標記安全區域
+        # 安全區域
         ax_pitch.axhspan(-0.5, 0.5, alpha=0.15, color='green', zorder=0)
         ax_pitch.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
         
@@ -133,23 +185,18 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         # === 相似度追蹤圖 ===
         ax_similarity = fig.add_subplot(gs[2])
         
-        # 繪製已播放部分
         if np.any(mask_played):
             ax_similarity.plot(times[mask_played], similarities[mask_played], 
                               color='#2E86AB', linewidth=3, zorder=3)
             ax_similarity.fill_between(times[mask_played], similarities[mask_played], 0,
                                       alpha=0.3, color='#2E86AB', zorder=2)
         
-        # 繪製未播放部分
         if np.any(mask_future):
             ax_similarity.plot(times[mask_future], similarities[mask_future], 
                               color='lightgray', linewidth=2, alpha=0.5, zorder=1)
         
-        # 當前播放位置標記
         ax_similarity.axvline(x=current_time, color='blue', linestyle='-', linewidth=3, zorder=4)
         ax_similarity.axhline(y=70, color='gray', linestyle='--', alpha=0.5)
-        ax_similarity.fill_between([x_min, x_max], 70, 100, alpha=0.1, color='green')
-        ax_similarity.fill_between([x_min, x_max], 0, 70, alpha=0.1, color='red')
         
         ax_similarity.set_xlabel('時間 (秒)', fontsize=11)
         ax_similarity.set_ylabel('相似度分數', fontsize=11)
@@ -157,24 +204,34 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         ax_similarity.grid(True, alpha=0.3)
         ax_similarity.set_ylim(0, 105)
         ax_similarity.set_xlim(x_min, x_max)
-    
-    # 生成動畫
-    total_frames = int(duration * fps)
-    anim = animation.FuncAnimation(fig, animate, frames=total_frames, 
-                                   interval=1000/fps, blit=False)
-    
-    # 保存無音訊的影片
+
+    # 暫存無音訊影片路徑
     temp_video = output_path.replace('.mp4', '_no_audio.mp4')
     
     try:
-        progress(0.3, desc="正在渲染動畫幀...")
-        print("⏳ 正在渲染動畫幀（這可能需要一些時間）...")
+        print("⏳ 正在渲染動畫幀...")
         writer = animation.FFMpegWriter(fps=fps, bitrate=1800, codec='libx264')
-        anim.save(temp_video, writer=writer, dpi=100)
+        
+        # 手動控制寫入迴圈以更新進度條
+        with writer.saving(fig, temp_video, dpi=100):
+            for i in range(total_frames):
+                draw_frame(i)
+                writer.grab_frame()
+                
+                # 更新 Gradio 進度條
+                if progress:
+                    # 我們假設影片生成佔總進度的 30% 到 90%
+                    # current_progress = 0.3 + (i / total_frames) * 0.6
+                    # 或者單純顯示渲染進度
+                    desc = f"渲染動畫中... {i}/{total_frames} 幀"
+                    progress(0.2 + 0.7 * (i / total_frames), desc=desc)
+
         plt.close(fig)
         
-        progress(0.8, desc="正在合併音訊...")
         print("🎵 正在合併音訊...")
+        if progress:
+            progress(0.95, desc="合併音軌中...")
+
         # 使用 ffmpeg 合併音訊
         result = subprocess.run([
             'ffmpeg', '-y', '-loglevel', 'error',
@@ -193,24 +250,20 @@ def generate_pitch_animation_video(pitch_timeline, mixed_audio_path, output_path
         if os.path.exists(temp_video):
             os.remove(temp_video)
         
-        progress(1.0, desc="動畫影片生成完成！")
         print(f"✅ 動畫影片生成完成！")
         return output_path
         
     except FileNotFoundError:
         print("❌ 錯誤：系統未安裝 ffmpeg")
-        print("請執行：brew install ffmpeg")
         return None
     except Exception as e:
         print(f"❌ 生成影片時發生錯誤: {e}")
         import traceback
         traceback.print_exc()
-        # 如果合併失敗，返回無音訊版本
         if os.path.exists(temp_video):
-            print(f"⚠️ 返回無音訊版本: {temp_video}")
             return temp_video
         return None
-
+    
 # --- 即時播放分析全域變數 ---
 class PlaybackState:
     """播放狀態管理類"""
@@ -224,20 +277,25 @@ class PlaybackState:
 playback_state = PlaybackState()
 
 # 核心邏輯 7: 預計算音高差異數據 (Pre-compute Pitch Difference Data)
-def precompute_pitch_differences(features_input, features_ref, interval=0.1, progress=gr.Progress()):
+def precompute_pitch_differences(features_input, features_ref, interval=0.1):
     """
     預先計算整段音訊每個時間點的音高差異。
-    """
-    progress(0, desc="開始預計算音高數據...")
     
+    參數:
+        features_input: 輸入音訊特徵
+        features_ref: 參考音訊特徵
+        interval: 取樣間隔（秒）
+    
+    返回:
+        pitch_timeline: 包含時間戳和音高差異的列表
+    """
     frames_per_interval = int(interval * TARGET_SR / HOP_LENGTH)
+    
     min_frames = min(features_input.shape[0], features_ref.shape[0])
     
     pitch_timeline = []
-    total_intervals = max(1, min_frames // frames_per_interval)
     
-    for idx, frame_idx in enumerate(progress.tqdm(range(0, min_frames, frames_per_interval), 
-                                                   desc="計算音高差異")):
+    for frame_idx in range(0, min_frames, frames_per_interval):
         # 取一小段特徵進行分析（使用 0.5 秒的視窗）
         window_size = int(0.5 * TARGET_SR / HOP_LENGTH)
         end_idx = min(frame_idx + window_size, min_frames)
@@ -281,6 +339,14 @@ def precompute_pitch_differences(features_input, features_ref, interval=0.1, pro
 def update_realtime_display(pitch_timeline, current_time):
     """
     根據當前播放時間更新即時音高顯示。
+    
+    參數:
+        pitch_timeline: 預計算的音高時間軸數據
+        current_time: 當前播放時間（秒）
+    
+    返回:
+        display_text: 格式化的顯示文本
+        plot_fig: 即時音高圖表
     """
     if not pitch_timeline:
         return "暫無數據", None
@@ -332,6 +398,11 @@ def get_note_name(pitch_class):
 def plot_realtime_pitch(pitch_timeline, current_time, window_size=10.0):
     """
     繪製即時音高差異圖表，顯示當前播放位置。
+    
+    參數:
+        pitch_timeline: 音高時間軸數據
+        current_time: 當前播放時間
+        window_size: 顯示的時間視窗大小（秒）
     """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
     
@@ -392,12 +463,17 @@ def plot_realtime_pitch(pitch_timeline, current_time, window_size=10.0):
     return fig
 
 # 核心邏輯 5: 視窗式音準分析 (Windowed Pitch Analysis)
-def windowed_pitch_analysis(features_input, features_ref, window_size=5.0, overlap=2.0, progress=gr.Progress()):
+def windowed_pitch_analysis(features_input, features_ref, window_size=3.0, overlap=1.0):
     """
     使用滑動視窗分析音準，每個視窗獨立進行 DTW 和音準評估。
-    """
-    progress(0, desc="開始視窗式分析...")
     
+    參數:
+        window_size: 視窗大小（秒）
+        overlap: 重疊大小（秒）
+    
+    返回:
+        results: 包含每個視窗分析結果的列表
+    """
     # 計算每個視窗的幀數
     frames_per_window = int(window_size * TARGET_SR / HOP_LENGTH)
     frames_per_step = int((window_size - overlap) * TARGET_SR / HOP_LENGTH)
@@ -413,12 +489,7 @@ def windowed_pitch_analysis(features_input, features_ref, window_size=5.0, overl
     window_start = 0
     window_idx = 0
     
-    # 計算總視窗數
-    total_windows = max(1, (min_frames - frames_per_window) // frames_per_step + 1)
-    
     while window_start + frames_per_window <= min_frames:
-        progress(window_idx / total_windows, desc=f"分析視窗 {window_idx+1}/{total_windows}")
-        
         window_end = window_start + frames_per_window
         
         # 提取當前視窗的特徵
@@ -444,7 +515,9 @@ def windowed_pitch_analysis(features_input, features_ref, window_size=5.0, overl
             )
             
             # 計算節奏分數
-            tempo_score = calculate_tempo_score(len(input_window), len(ref_window))
+            # tempo_score = calculate_tempo_score(len(input_window), len(ref_window))
+            tempo_score = calculate_tempo_score(input_window, ref_window)  # 現在傳特徵矩陣
+
             
             # 整體視窗分數
             overall_score = 0.7 * pitch_score + 0.3 * tempo_score
@@ -478,6 +551,11 @@ def windowed_pitch_analysis(features_input, features_ref, window_size=5.0, overl
 def calculate_window_pitch_score(chroma_input, chroma_ref, D, wp):
     """
     計算視窗內的音準分數和偏差。
+    
+    返回:
+        pitch_score: 音準分數 (0-100)
+        pitch_deviation: 音高偏差（半音數）
+        pitch_direction: 偏差方向 ("偏高", "偏低", "準確")
     """
     # 計算平均音高
     input_peak_bins = np.argmax(chroma_input, axis=1)
@@ -507,15 +585,23 @@ def calculate_window_pitch_score(chroma_input, chroma_ref, D, wp):
     return pitch_score, abs(pitch_diff), pitch_direction
 
 
-def calculate_tempo_score(input_frames, ref_frames):
-    """計算節奏分數"""
-    tempo_ratio = input_frames / (ref_frames + 1e-8)
+def calculate_tempo_score(input_feat, ref_feat):
+    """
+    節奏分數 (0–100)。直接呼叫 tempo_similarity。
+    input_feat, ref_feat 皆為 (N_frames, 13) ndarray
+    """
+    return tempo_similarity(input_feat, ref_feat)
+
+# TODO: wrong definition
+# def calculate_tempo_score(input_frames, ref_frames):
+#     """計算節奏分數"""
+#     tempo_ratio = input_frames / (ref_frames + 1e-8)
     
-    # 理想比例為 1，偏離越多分數越低
-    tempo_deviation = abs(tempo_ratio - 1.0)
-    tempo_score = max(0, 100 * (1 - tempo_deviation * 2))
+#     # 理想比例為 1，偏離越多分數越低
+#     tempo_deviation = abs(tempo_ratio - 1.0)
+#     tempo_score = max(0, 100 * (1 - tempo_deviation * 2))
     
-    return tempo_score
+#     return tempo_score
 
 
 # 核心邏輯 6: 視窗分析結果可視化 (Windowed Analysis Visualization)
@@ -634,36 +720,41 @@ def generate_windowed_feedback(results):
     return '\n'.join(feedback)
 
 
+
+
+
+
+
+
+
+
+
 # 核心邏輯 1: 特徵提取 (Feature Extraction)
-def extract_features(audio_path, progress=gr.Progress()):
+def extract_features(audio_path):
     """載入音訊、標準化處理，並提取 Chroma 和 RMS 特徵。"""
     if not audio_path or not os.path.exists(audio_path):
         raise gr.Error("請錄製或上傳有效的音訊檔案。")
 
     try:
-        progress(0, desc="載入音訊檔案...")
         # 載入音訊，並重取樣至目標 SR，轉換為單聲道
         y, sr = librosa.load(audio_path, sr=TARGET_SR, mono=True)
     except Exception as e:
         raise gr.Error(f"載入音訊檔案失敗: {e}")
 
     # 檢查音訊長度是否足夠進行分析
-    MIN_SAMPLES = 2048
+    MIN_SAMPLES = 2048 # FFT 運算需要一定的樣本數
     if len(y) < MIN_SAMPLES:
         raise gr.Error(f"音訊長度過短 ({len(y)/sr:.2f} 秒)，無法進行有效分析。")
 
-    progress(0.3, desc="提取 Chroma 特徵...")
     # 1. Chroma feature (音高/和聲內容)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
     
-    progress(0.7, desc="提取 RMS 特徵...")
     # 2. RMS (Root-Mean-Square Energy for volume)
     rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)
     
     # 合併特徵並轉置 -> (N_frames, 13)
     features = np.vstack([chroma, rms])
     
-    progress(1.0, desc="特徵提取完成")
     return features.T
 
 # 核心邏輯 2: DTW 對齊 (DTW Alignment)
@@ -688,11 +779,13 @@ def analyze_results(wp, D, features_input, features_ref):
     # 正規化 DTW 成本 (值越低越相似)
     normalized_cost = D[-1, -1] / len(wp)
     
-    # 將成本轉換為 0-100 的分數，越高越好
+    # 【已修改】將成本轉換為 0-100 的分數，越高越好
+    # 使用指數衰減函數，k 值可調整轉換的靈敏度
     k = 2.0 
     similarity_score = 100 * np.exp(-k * normalized_cost)
     
-    # 偵測是否為不同歌曲
+    # 【新增】偵測是否為不同歌曲
+    # 設定一個經驗閾值，若成本過高，可能代表是完全不同的歌曲
     DIFFERENT_SONG_THRESHOLD = 1.0 
     if normalized_cost > DIFFERENT_SONG_THRESHOLD:
         feedback.append(
@@ -782,6 +875,7 @@ def analyze_results(wp, D, features_input, features_ref):
                 else:
                     suggestion = "音準或音色不匹配，請注意此處的發聲穩定性。"
             
+            # 【已修改】修復 "0 秒到 0 秒" 問題
             if time_end - time_start < TIME_PER_FRAME:
                 feedback.append(f"• **在 {time_start:.2f} 秒附近:** {suggestion}")
             else:
@@ -810,7 +904,7 @@ def plot_dtw_path(D, wp):
     plt.tight_layout()
     return fig
 
-# 混合音訊 (Mix Audio)
+# 【新增】核心邏輯 5: 混合音訊 (Mix Audio)
 def mix_audio(path1, path2):
     """將兩段音訊混合成一個檔案以便於比較。"""
     try:
@@ -840,26 +934,22 @@ def mix_audio(path1, path2):
         return None
 
 def singing_evaluator(input_audio_path, ref_audio_path, generate_video=True, progress=gr.Progress()):
-    """Gradio 介面的主要處理函數 - 使用視窗分析。"""
+    """Gradio 介面的主要處理函數 - 支援進度顯示。"""
     if not input_audio_path or not ref_audio_path:
         raise gr.Error("請同時上傳或錄製您的歌聲和參考音訊。")
 
     try:
+        progress(0.05, desc="正在提取音訊特徵...")
         # 1. 特徵提取
-        progress(0, desc="開始分析...")
-        progress(0.05, desc="提取輸入音訊特徵...")
-        features_input = extract_features(input_audio_path, progress)
+        features_input = extract_features(input_audio_path)
+        features_ref = extract_features(ref_audio_path)
         
-        progress(0.15, desc="提取參考音訊特徵...")
-        features_ref = extract_features(ref_audio_path, progress)
-        
+        progress(0.1, desc="進行視窗式 DTW 分析...")
         # 2. 視窗式分析（5秒視窗，2秒重疊）
-        progress(0.25, desc="執行視窗式音準分析...")
         window_results = windowed_pitch_analysis(features_input, features_ref, 
-                                                 window_size=5.0, overlap=2.0, progress=progress)
+                                                 window_size=3.0, overlap=1.0)
         
         # 3. 計算整體分數
-        progress(0.55, desc="計算整體分數...")
         if window_results:
             avg_score = np.mean([r['overall_score'] for r in window_results])
             similarity_score = f"{avg_score:.1f}"
@@ -867,36 +957,34 @@ def singing_evaluator(input_audio_path, ref_audio_path, generate_video=True, pro
             similarity_score = "N/A"
         
         # 4. 生成文字建議
-        progress(0.6, desc="生成改進建議...")
         feedback_text = generate_windowed_feedback(window_results)
         
         # 5. 可視化視窗分析結果
-        progress(0.65, desc="生成視覺化圖表...")
         windowed_plot = plot_windowed_analysis(window_results)
 
+        progress(0.15, desc="處理音訊混合...")
         # 6. 混合音訊
-        progress(0.7, desc="混合音訊...")
         mixed_audio_path = mix_audio(input_audio_path, ref_audio_path)
         
         # 7. 預計算即時音高數據
-        progress(0.75, desc="預計算即時音高數據...")
-        pitch_timeline = precompute_pitch_differences(features_input, features_ref, interval=0.1, progress=progress)
+        pitch_timeline = precompute_pitch_differences(features_input, features_ref, interval=0.1)
         
         # 8. 生成動畫影片（可選）
         animation_video_path = None
         if generate_video and pitch_timeline:
+            progress(0.2, desc="準備生成動畫影片...")
             try:
-                progress(0.85, desc="生成動畫影片...")
-                print("🎬 開始生成動畫影片...")
+                # 這裡傳入 progress 物件
                 animation_video_path = generate_pitch_animation_video(
                     pitch_timeline, mixed_audio_path, progress=progress
                 )
             except Exception as e:
                 print(f"❌ 生成動畫影片失敗: {e}")
                 animation_video_path = None
-        
+        else:
+             progress(1.0, desc="分析完成！")
+
         # 9. 返回所有結果
-        progress(1.0, desc="分析完成！")
         return (similarity_score, feedback_text, windowed_plot, 
                 input_audio_path, ref_audio_path, mixed_audio_path,
                 animation_video_path)
@@ -958,10 +1046,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title=title) as demo:
         gr.Markdown("💡 **使用提示**: 點擊播放按鈕，影片會同步顯示音高分析動畫，讓您清楚看到每個時間點的表現")
 
     # 主分析流程
-    def run_analysis(input_audio_path, ref_audio_path, should_generate_video):
+    def run_analysis(input_audio_path, ref_audio_path, should_generate_video, progress=gr.Progress()):
+        # 將 progress 傳遞給 evaluator
         (score, feedback, plot, _, _, mixed_path, 
-         animation_path) = singing_evaluator(input_audio_path, ref_audio_path, 
-                                            generate_video=should_generate_video)
+        animation_path) = singing_evaluator(input_audio_path, ref_audio_path, 
+                                            generate_video=should_generate_video,
+                                            progress=progress)
         
         return {
             result_outputs_group: gr.Column(visible=True),
@@ -973,17 +1063,49 @@ with gr.Blocks(theme=gr.themes.Soft(), title=title) as demo:
             mixed_playback: gr.Audio(value=mixed_path, label="🎛️ 疊加播放 (Mixed for Comparison)"),
             animation_video_output: gr.Video(value=animation_path, label="🎵 即時音高分析動畫")
         }
+    
+    def prepare_ui():
+        """
+        階段 1: 點擊後立即執行
+        - 隱藏舊結果
+        - 鎖定按鈕並更改文字
+        """
+        return (
+            gr.Column(visible=False),              # 隱藏結果區塊
+            gr.Button(value="⏳ 評估中請稍後...", interactive=False) # 更新按鈕狀態
+        )
 
-    # 事件綁定
+    def finish_analysis():
+        """
+        階段 3: 分析完成後執行
+        - 恢復按鈕文字與可點擊狀態
+        """
+        return gr.Button(value="🚀 開始分析與評估", interactive=True)
+    
     analyze_btn.click(
-        fn=lambda: gr.Column(visible=False),
-        outputs=[result_outputs_group]
+        fn=prepare_ui, 
+        inputs=[], 
+        outputs=[result_outputs_group, analyze_btn],
+        queue=False # 關鍵：不排隊，立即執行
     ).then(
         fn=run_analysis,
         inputs=[input_audio, ref_audio, generate_video_checkbox],
         outputs=[result_outputs_group, score_display, feedback_output, windowed_plot_output, 
                 input_playback, ref_playback, mixed_playback, animation_video_output]
+    ).then(
+        fn=finish_analysis,
+        inputs=[],
+        outputs=[analyze_btn]
     )
+
+    
 
 if __name__ == "__main__":
     demo.launch(share=True)
+
+
+
+"""
+1. progress bar of generating video(current running time/expected time to run)
+
+"""
