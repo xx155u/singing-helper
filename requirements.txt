@@ -4,3 +4,4 @@ librosa
 matplotlib
 moviepy
 opencv-python
+soundfile
