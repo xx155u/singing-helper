@@ -778,6 +778,5 @@ with gr.Blocks(theme=gr.themes.Soft(), title=title) as demo:
         outputs=[analyze_btn]
     )
 
-
 if __name__ == "__main__":
     demo.launch(share=True)
